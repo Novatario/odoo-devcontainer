@@ -1,0 +1,62 @@
+# Rebuild the image every night from the newest commit of Odoo 19.0.
+#
+# The image is published only after test/smoke.sh has started Odoo in it, so a
+# broken upstream commit never reaches anyone: the 19.0 tag stays on the last
+# image that passed. Every published image also gets an immutable tag,
+# 19.0-<yyyymmdd>-<odoo commit>, to go back to.
+name: build
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/novatario/odoo-devcontainer
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the newest Odoo 19.0 commit
+        id: odoo
+        run: |
+          sha="$(git ls-remote https://github.com/odoo/odoo.git refs/heads/19.0 | cut -f1)"
+          test -n "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=19.0-$(date -u +%Y%m%d)-${sha:0:10}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: odoo-devcontainer:test
+          build-args: ODOO_COMMIT=${{ steps.odoo.outputs.sha }}
+
+      - name: Start Odoo once
+        run: docker run --rm odoo-devcontainer:test bash -s < test/smoke.sh
+
+      - name: Publish
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          for tag in 19.0 "${{ steps.odoo.outputs.tag }}"; do
+            docker tag odoo-devcontainer:test "$IMAGE:$tag"
+            docker push "$IMAGE:$tag"
+          done
